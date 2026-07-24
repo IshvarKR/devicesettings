@@ -24,14 +24,29 @@ DIST_SUBDIRS =
 
 lib_LTLIBRARIES = libds.la
 
+AIDL_CPPFLAGS = -I$(includedir)/rdk-halif-aidl \
+        -I$(includedir)/binder_sdk
+
+AIDL_LIBS = -L$(libdir)/rdk-halif-aidl \
+        -lhdmiinput-vcurrent-cpp \
+        -lplanecontrol-vcurrent-cpp \
+        -lcommon-vcurrent-cpp \
+        -lbinder \
+        -lutils
+
 libds_la_CPPFLAGS = -I ./include \
                     -I=$(includedir)/rdk/ds-hal \
                     -I=$(includedir)/rdk/iarmbus \
-                    -I=$(includedir)/rdk/halif/ds-hal
+            -I=$(includedir)/rdk/halif/ds-hal \
+            $(AIDL_CPPFLAGS)
 
 libds_la_CXXFLAGS = -g -fPIC -D_REENTRANT -Wall -std=c++0x
 
 libds_la_LDFLAGS = -L../rpc/cli/.libs/ $(DS_LDFLAG)
+
+libds_la_LIBADD = -ldshalcli \
+          -lIARMBus \
+          $(AIDL_LIBS)
 
 libds_la_SOURCES = aspectRatio.cpp \
                    audioStereoMode.cpp \
@@ -56,6 +71,7 @@ libds_la_SOURCES = aspectRatio.cpp \
                    frontPanelIndicator.cpp \
                    videoDeviceConfig.hpp \
                    videoResolution.cpp \
+                   hdmiIn.cpp \
                    audioOutputPort.cpp \
                    frontPanelTextDisplay.cpp \
                    videoDevice.cpp \
@@ -63,3 +79,4 @@ libds_la_SOURCES = aspectRatio.cpp \
                    host.cpp \
                    manager.cpp \
                    videoDFC.cpp
+

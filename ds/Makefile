@@ -22,6 +22,20 @@ LIBNAME     := ds
 LIBNAMEFULL := lib$(LIBNAME).so
 LIBNAMECLI  := lib$(LIBNAME)-cli.so
 INSTALL     := $(PWD)/install
+prefix      ?= /usr
+includedir  ?= $(prefix)/include
+libdir      ?= $(prefix)/lib
+
+AIDL_INCLUDE_DIR   ?= $(includedir)/rdk-halif-aidl
+BINDER_INCLUDE_DIR ?= $(includedir)/binder_sdk
+AIDL_LIB_DIR       ?= $(libdir)/rdk-halif-aidl
+BINDER_LIB_DIR     ?= $(libdir)
+
+AIDL_INCLUDE  := -I$(AIDL_INCLUDE_DIR) -I$(BINDER_INCLUDE_DIR)
+AIDL_LDFLAGS ?= -L$(AIDL_LIB_DIR) -L$(BINDER_LIB_DIR) \
+				-lhdmiinput-vcurrent-cpp -lplanecontrol-vcurrent-cpp \
+				-lcommon-vcurrent-cpp -lbinder -lutils
+
 OBJS        := $(patsubst %.cpp,%.o,$(wildcard *.cpp))
 # In future add a conditional to choose implementation class based on build configuration
 OBJS        += iarm/IarmImpl.o
@@ -49,6 +63,7 @@ endif
 
 
 INCLUDE      += $(HAL_INCLUDE)
+INCLUDE      += $(AIDL_INCLUDE)
 CFLAGS       +=$(HAL_BUILDFLAGS)
 
 CFLAGS      += $(INCLUDE)
@@ -59,8 +74,8 @@ all: install
 
 library: $(OBJS)
 	@echo "Building $(LIBNAMEFULL) ...."
-	$(CXX) $(OBJS) $(CFLAGS) $(DSHAL_LDFLAGS) -L$(INSTALL)/lib -lIARMBus -ldshalcli -shared -o $(LIBNAMEFULL)
-	$(CXX) $(OBJS) $(CFLAGS) -L$(INSTALL)/lib -lIARMBus -ldshalcli -shared -o $(LIBNAMECLI)
+	$(CXX) $(OBJS) $(CFLAGS) $(DSHAL_LDFLAGS) $(AIDL_LDFLAGS) -L$(INSTALL)/lib -lIARMBus -ldshalcli -shared -o $(LIBNAMEFULL)
+	$(CXX) $(OBJS) $(CFLAGS) $(AIDL_LDFLAGS) -L$(INSTALL)/lib -lIARMBus -ldshalcli -shared -o $(LIBNAMECLI)
 
 %.o: %.cpp
 	@echo "Building $@ ...."
@@ -76,5 +91,6 @@ uninstall:
 clean:
 	@echo "Cleaning the directory..."
 	@$(RM) $(OBJS) $(LIBNAMEFULL)
+
 
 
