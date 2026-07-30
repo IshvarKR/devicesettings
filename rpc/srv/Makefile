@@ -35,8 +35,18 @@ INCLUDE     := -I$(PWD)                         \
 endif        
 
 
+AIDL_INCLUDE_DIR   ?= $(includedir)/rdk-halif-aidl
+BINDER_INCLUDE_DIR ?= $(includedir)/binder_sdk
+AIDL_LIB_DIR       ?= $(libdir)/rdk-halif-aidl
+BINDER_LIB_DIR     ?= $(libdir)
+AIDL_INCLUDE  := -I$(AIDL_INCLUDE_DIR) -I$(BINDER_INCLUDE_DIR)
+AIDL_LDFLAGS ?= -L$(AIDL_LIB_DIR) -L$(BINDER_LIB_DIR) \
+                -lhdmiinput-vcurrent-cpp -lplanecontrol-vcurrent-cpp \
+                -lcommon-vcurrent-cpp -lbinder -lutils
+
 INCLUDE      += $(HAL_INCLUDE)
 INCLUDE	     += -I=$(includedir)/rdk/ds-hal
+INCLUDE      += $(AIDL_INCLUDE)
 
 CFLAGS      += $(INCLUDE)
 
@@ -52,7 +62,7 @@ all: install
 
 library: $(OBJS)
 	@echo "Building $(LIBNAMEFULL) ...."
-	$(CXX) $(OBJS) $(CFLAGS) $(LDFLAGS) -shared -o $(LIBNAMEFULL)
+	$(CXX) $(OBJS) $(CFLAGS) $(LDFLAGS) $(AIDL_LDFLAGS) -shared -o $(LIBNAMEFULL)
 
 %.o: %.c
 	@echo "Building $@ ...."
@@ -72,5 +82,6 @@ uninstall:
 clean:
 	@echo "Cleaning the directory..."
 	@$(RM) $(OBJS) $(LIBNAMEFULL)
+
 
 

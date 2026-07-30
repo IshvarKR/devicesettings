@@ -80,7 +80,7 @@
 #define IARM_BUS_Lock(lock) pthread_mutex_lock(&fpLock)
 #define IARM_BUS_Unlock(lock) pthread_mutex_unlock(&fpLock)
 #define TVSETTINGS_DALS_RFC_PARAM "Device.DeviceInfo.X_RDKCENTRAL-COM_RFC.Feature.TvSettings.DynamicAutoLatency"
-
+[O
 static bool isDalsEnabled = false;
 static int m_isInitialized = 0;
 static int m_isPlatInitialized=0;
@@ -135,7 +135,321 @@ static dsHdmiInCap_t hdmiInCap_gs;
 #include <iostream>
 #include "hostPersistence.hpp"
 #include <sstream>
+#include <mutex>
+#include <map>
+#include <vector>
+#include <algorithm>
 
+#include <binder/IServiceManager.h>
+#include <binder/ProcessState.h>
+#include <utils/String16.h>
+#include <com/rdk/hal/hdmiinput/IHDMIInputManager.h>
+#include <com/rdk/hal/hdmiinput/IHDMIInput.h>
+#include <com/rdk/hal/hdmiinput/IHDMIInputController.h>
+#include <com/rdk/hal/hdmiinput/IHDMIInputControllerListener.h>
+#include <com/rdk/hal/hdmiinput/BnHDMIInputControllerListener.h>
+#include <com/rdk/hal/hdmiinput/IHDMIInputEventListener.h>
+#include <com/rdk/hal/hdmiinput/BnHDMIInputEventListener.h>
+#include <com/rdk/hal/hdmiinput/Capabilities.h>
+#include <com/rdk/hal/hdmiinput/PlatformCapabilities.h>
+#include <com/rdk/hal/hdmiinput/SignalState.h>
+#include <com/rdk/hal/hdmiinput/State.h>
+#include <com/rdk/hal/hdmiinput/HDCPStatus.h>
+#include <com/rdk/hal/hdmiinput/HDCPProtocolVersion.h>
+#include <com/rdk/hal/hdmiinput/HDMIVersion.h>
+#include <com/rdk/hal/planecontrol/IPlaneControl.h>
+#include <com/rdk/hal/planecontrol/PlaneCapabilities.h>
+#include <com/rdk/hal/planecontrol/Property.h>
+#include <com/rdk/hal/planecontrol/PropertyKVPair.h>
+#include <com/rdk/hal/planecontrol/SourcePlaneMapping.h>
+#include <com/rdk/hal/planecontrol/SourceType.h>
+#include <com/rdk/hal/PropertyValue.h>
+
+using android::sp;
+using android::defaultServiceManager;
+using android::interface_cast;
+using android::String16;
+using android::ProcessState;
+using namespace com::rdk::hal::hdmiinput;
+using namespace com::rdk::hal::planecontrol;
+
+#define HDMI_IN_PRIMARY_PLANE_INDEX 0
+
+// Per-port AIDL runtime context
+struct AidlPortCtx {
+    sp<IHDMIInput>              hdmiInput;
+    sp<IHDMIInputController>    controller;
+    sp<IHDMIInputControllerListener> ctrlListener;
+    sp<IHDMIInputEventListener> evtListener;
+    bool isOpen{false};
+    bool isStarted{false};
+    bool connected{false};
+    int  signalState{-1};
+    int  lastVIC{0};
+    bool vrrActive{false};
+    double vrrFrameRate{0.0};
+};
+
+static sp<IHDMIInputManager>       s_aidlHdmiMgr;
+static sp<IPlaneControl>           s_aidlPlaneCtrl;
+static std::mutex                  s_aidlMutex;
+static std::map<int, AidlPortCtx>  s_aidlPorts;
+static int                         s_aidlActivePort{-1};
+static uint8_t                     s_aidlPortCount{0};
+static bool                        s_aidlPortArcCapable[dsHDMI_IN_PORT_MAX] = {};
+
+static sp<IHDMIInputManager> getAidlHdmiMgr()
+{
+    std::lock_guard<std::mutex> lk(s_aidlMutex);
+    if (!s_aidlHdmiMgr) {
+        ProcessState::self()->startThreadPool();
+        sp<android::IServiceManager> sm = defaultServiceManager();
+        if (sm) {
+            s_aidlHdmiMgr = interface_cast<IHDMIInputManager>(
+                sm->getService(String16(IHDMIInputManager::serviceName().c_str())));
+        }
+    }
+    return s_aidlHdmiMgr;
+}
+
+static sp<IPlaneControl> getAidlPlaneCtrl()
+{
+    std::lock_guard<std::mutex> lk(s_aidlMutex);
+    if (!s_aidlPlaneCtrl) {
+        sp<android::IServiceManager> sm = defaultServiceManager();
+        if (sm) {
+            s_aidlPlaneCtrl = interface_cast<IPlaneControl>(
+                sm->getService(String16(IPlaneControl::serviceName().c_str())));
+        }
+    }
+    return s_aidlPlaneCtrl;
+}
+
+static void vicToResolutionObj_srv(int vic, dsVideoPortResolution_t& res)
+{
+    memset(&res, 0, sizeof(res));
+    switch (vic) {
+        case 1: case 2: case 3:
+            res.pixelResolution = dsVIDEO_PIXELRES_720x480;
+            res.frameRate       = dsVIDEO_FRAMERATE_59dot94; break;
+        case 4:
+            res.pixelResolution = dsVIDEO_PIXELRES_1280x720;
+            res.frameRate       = dsVIDEO_FRAMERATE_59dot94; break;
+        case 5:
+            res.pixelResolution = dsVIDEO_PIXELRES_1920x1080;
+            res.interlaced      = true;
+            res.frameRate       = dsVIDEO_FRAMERATE_59dot94; break;
+        case 16:
+            res.pixelResolution = dsVIDEO_PIXELRES_1920x1080;
+            res.frameRate       = dsVIDEO_FRAMERATE_59dot94; break;
+        case 17: case 18:
+            res.pixelResolution = dsVIDEO_PIXELRES_720x576;
+            res.frameRate       = dsVIDEO_FRAMERATE_50; break;
+        case 19:
+            res.pixelResolution = dsVIDEO_PIXELRES_1280x720;
+            res.frameRate       = dsVIDEO_FRAMERATE_50; break;
+        case 31:
+            res.pixelResolution = dsVIDEO_PIXELRES_1920x1080;
+            res.frameRate       = dsVIDEO_FRAMERATE_50; break;
+        case 93: case 94: case 95: case 96: case 97:
+            res.pixelResolution = dsVIDEO_PIXELRES_3840x2160;
+            res.frameRate       = (vic >= 96) ? dsVIDEO_FRAMERATE_50 : dsVIDEO_FRAMERATE_25; break;
+        default:
+            res.pixelResolution = dsVIDEO_PIXELRES_1920x1080;
+            res.frameRate       = dsVIDEO_FRAMERATE_60; break;
+    }
+}
+
+// ---- AIDL listener: per-port IHDMIInputController callbacks ----
+class SrvHdmiCtrlListener
+    : public ::com::rdk::hal::hdmiinput::BnHDMIInputControllerListener
+{
+public:
+    explicit SrvHdmiCtrlListener(int portId) : m_portId(portId) {}
+
+    ::android::binder::Status onConnectionStateChanged(bool connected) override {
+        INT_INFO("[srv-aidl] port %d connected=%d\n", m_portId, connected);
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.find(m_portId);
+            if (it != s_aidlPorts.end()) it->second.connected = connected;
+        }
+        _dsHdmiInConnectCB((dsHdmiInPort_t)m_portId, connected);
+        return ::android::binder::Status::ok();
+    }
+
+    ::android::binder::Status onSignalStateChanged(
+            ::com::rdk::hal::hdmiinput::SignalState signalState) override {
+        INT_INFO("[srv-aidl] port %d signalState=%d\n", m_portId, (int)signalState);
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.find(m_portId);
+            if (it != s_aidlPorts.end()) it->second.signalState = (int)signalState;
+        }
+        _dsHdmiInSignalChangeCB((dsHdmiInPort_t)m_portId,
+            (dsHdmiInSignalStatus_t)(int)signalState);
+        return ::android::binder::Status::ok();
+    }
+
+    ::android::binder::Status onVIChanged(
+            ::com::rdk::hal::hdmiinput::VIC vic) override {
+        INT_INFO("[srv-aidl] port %d VIC=%d\n", m_portId, (int)vic);
+        dsVideoPortResolution_t res;
+        vicToResolutionObj_srv((int)vic, res);
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.find(m_portId);
+            if (it != s_aidlPorts.end()) it->second.lastVIC = (int)vic;
+        }
+        _dsHdmiInVideoModeUpdateCB((dsHdmiInPort_t)m_portId, res);
+        return ::android::binder::Status::ok();
+    }
+
+    ::android::binder::Status onVRRChanged(
+            bool vrrActive, bool /*mConstActive*/, bool /*fastVActive*/,
+            double frameRate) override {
+        dsVRRType_t vrrType = vrrActive
+            ? (frameRate > 0.0 ? dsVRR_AMD_FREESYNC : dsVRR_HDMI_VRR)
+            : dsVRR_NONE;
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.find(m_portId);
+            if (it != s_aidlPorts.end()) {
+                it->second.vrrActive    = vrrActive;
+                it->second.vrrFrameRate = frameRate;
+            }
+        }
+        _dsHdmiInVRRChangeCB((dsHdmiInPort_t)m_portId, vrrType);
+        return ::android::binder::Status::ok();
+    }
+
+    ::android::binder::Status onAVIInfoFrame(const std::vector<uint8_t>&) override
+        { return ::android::binder::Status::ok(); }
+    ::android::binder::Status onAudioInfoFrame(const std::vector<uint8_t>&) override
+        { return ::android::binder::Status::ok(); }
+    ::android::binder::Status onSPDInfoFrame(const std::vector<uint8_t>&) override
+        { return ::android::binder::Status::ok(); }
+    ::android::binder::Status onDRMInfoFrame(const std::vector<uint8_t>&) override
+        { return ::android::binder::Status::ok(); }
+    ::android::binder::Status onVendorSpecificInfoFrame(const std::vector<uint8_t>&) override
+        { return ::android::binder::Status::ok(); }
+    ::android::binder::Status onHDCPStatusChanged(
+            ::com::rdk::hal::hdmiinput::HDCPStatus,
+            ::com::rdk::hal::hdmiinput::HDCPProtocolVersion) override
+        { return ::android::binder::Status::ok(); }
+private:
+    int m_portId;
+};
+
+// ---- AIDL listener: port-level state / EDID change events ----
+class SrvHdmiEvtListener
+    : public ::com::rdk::hal::hdmiinput::BnHDMIInputEventListener
+{
+public:
+    explicit SrvHdmiEvtListener(int portId) : m_portId(portId) {}
+
+    ::android::binder::Status onStateChanged(
+            ::com::rdk::hal::hdmiinput::State /*oldState*/,
+            ::com::rdk::hal::hdmiinput::State newState) override {
+        bool presented = (newState == ::com::rdk::hal::hdmiinput::State::STARTED);
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            if (presented) s_aidlActivePort = m_portId;
+            else if (s_aidlActivePort == m_portId) s_aidlActivePort = -1;
+        }
+        dsHdmiInStatus_t status;
+        memset(&status, 0, sizeof(status));
+        status.activePort  = (dsHdmiInPort_t)m_portId;
+        status.isPresented = presented;
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.find(m_portId);
+            if (it != s_aidlPorts.end() && m_portId < dsHDMI_IN_PORT_MAX)
+                status.isPortConnected[m_portId] = it->second.connected;
+        }
+        _dsHdmiInStatusChangeCB(status);
+        return ::android::binder::Status::ok();
+    }
+    ::android::binder::Status onEDIDChange(const std::vector<uint8_t>&) override
+        { return ::android::binder::Status::ok(); }
+private:
+    int m_portId;
+};
+
+// ---- AIDL init: replaces dsHdmiInInit() + dlopen callback registrations ----
+static void aidlHdmiInInit()
+{
+    sp<IHDMIInputManager> mgr = getAidlHdmiMgr();
+    if (!mgr) {
+        INT_ERROR("[srv-aidl] IHDMIInputManager unavailable\n");
+        return;
+    }
+
+    std::vector<IHDMIInput::Id> portIds;
+    if (!mgr->getHDMIInputIds(&portIds).isOk()) {
+        INT_ERROR("[srv-aidl] getHDMIInputIds failed\n");
+        return;
+    }
+    s_aidlPortCount = (uint8_t)portIds.size();
+
+    for (const auto& id : portIds) {
+        int portIdx = id.value;
+        sp<IHDMIInput> hdmiInput;
+        if (!mgr->getHDMIInput(id, &hdmiInput).isOk() || !hdmiInput) {
+            INT_ERROR("[srv-aidl] getHDMIInput failed for port %d\n", portIdx);
+            continue;
+        }
+        AidlPortCtx ctx;
+        ctx.hdmiInput = hdmiInput;
+
+        Capabilities caps;
+        if (hdmiInput->getCapabilities(&caps).isOk() && portIdx < dsHDMI_IN_PORT_MAX) {
+            s_aidlPortArcCapable[portIdx] = caps.supportsARC;
+            m_hdmiPortVrrCaps[portIdx]    = caps.supportsVRR;
+        }
+
+        ctx.evtListener = sp<SrvHdmiEvtListener>::make(portIdx);
+        bool regOk = false;
+        hdmiInput->registerEventListener(ctx.evtListener, &regOk);
+
+        ctx.ctrlListener = sp<SrvHdmiCtrlListener>::make(portIdx);
+        sp<IHDMIInputController> ctrl;
+        if (hdmiInput->open(ctx.ctrlListener, &ctrl).isOk() && ctrl) {
+            ctx.controller = ctrl;
+            ctx.isOpen     = true;
+        }
+
+        std::lock_guard<std::mutex> lk(s_aidlMutex);
+        s_aidlPorts[portIdx] = std::move(ctx);
+        INT_INFO("[srv-aidl] port %d initialised\n", portIdx);
+    }
+}
+
+// ---- AIDL term: replaces dsHdmiInTerm() ----
+static void aidlHdmiInTerm()
+{
+    std::lock_guard<std::mutex> lk(s_aidlMutex);
+    for (auto& kv : s_aidlPorts) {
+        AidlPortCtx& ctx = kv.second;
+        if (ctx.isStarted && ctx.controller) {
+            ctx.controller->stop();
+            ctx.isStarted = false;
+        }
+        if (ctx.isOpen && ctx.hdmiInput && ctx.controller) {
+            bool ok = false;
+            ctx.hdmiInput->close(ctx.controller, &ok);
+            ctx.isOpen = false;
+        }
+        if (ctx.hdmiInput && ctx.evtListener) {
+            bool ok = false;
+            ctx.hdmiInput->unregisterEventListener(ctx.evtListener, &ok);
+        }
+    }
+    s_aidlPorts.clear();
+    s_aidlHdmiMgr   = nullptr;
+    s_aidlPlaneCtrl = nullptr;
+    s_aidlPortCount = 0;
+}
 
 using namespace std;
 
@@ -154,6 +468,14 @@ void getDynamicAutoLatencyConfig()
 }
 
 static dsError_t isHdmiARCPort (int iPort, bool* isArcEnabled) {
+[I    if (!s_aidlPorts.empty()) {
+        if (iPort >= 0 && iPort < dsHDMI_IN_PORT_MAX) {
+            *isArcEnabled = s_aidlPortArcCapable[iPort];
+            INT_INFO("[srv-aidl] isHdmiARCPort port %d arc=%d\n", iPort, *isArcEnabled);
+            return dsERR_NONE;
+        }
+        return dsERR_INVALID_PARAM;
+    }
     dsError_t eRet = dsERR_GENERAL; 
 
     typedef bool (*dsIsHdmiARCPort_t)(int iPortArg, bool *boolArg);
@@ -188,6 +510,25 @@ static dsError_t isHdmiARCPort (int iPort, bool* isArcEnabled) {
 }
 
 static dsError_t getEDIDBytesInfo (dsHdmiInPort_t iHdmiPort, unsigned char *edid, int *length) {
+    if (!s_aidlPorts.empty()) {
+        sp<IHDMIInput> hi;
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.find((int)iHdmiPort);
+            if (it == s_aidlPorts.end() || !it->second.hdmiInput) return dsERR_INVALID_PARAM;
+            hi = it->second.hdmiInput;
+        }
+        std::vector<uint8_t> edidVec;
+        bool ok = false;
+        if (!hi->getEDID(&edidVec, &ok).isOk() || !ok || edidVec.empty()) {
+            INT_ERROR("[srv-aidl] getEDID failed for port %d\n", (int)iHdmiPort);
+            return dsERR_GENERAL;
+        }
+        *length = (int)edidVec.size();
+        memcpy(edid, edidVec.data(), *length);
+        INT_INFO("[srv-aidl] getEDIDBytesInfo port %d len=%d\n", (int)iHdmiPort, *length);
+        return dsERR_NONE;
+    }
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetEDIDBytesInfo_t)(dsHdmiInPort_t iHdmiPort, unsigned char *edid, int *length);
     static dsGetEDIDBytesInfo_t dsGetEDIDBytesInfoFunc = 0;
@@ -219,6 +560,25 @@ static dsError_t getEDIDBytesInfo (dsHdmiInPort_t iHdmiPort, unsigned char *edid
 }
 
 static dsError_t getHDMISPDInfo (dsHdmiInPort_t iHdmiPort, unsigned char *spd) {
+    if (!s_aidlPorts.empty()) {
+        sp<IHDMIInput> hi;
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.find((int)iHdmiPort);
+            if (it == s_aidlPorts.end() || !it->second.hdmiInput) return dsERR_INVALID_PARAM;
+            hi = it->second.hdmiInput;
+        }
+        std::vector<uint8_t> spdVec;
+        bool ok = false;
+        if (!hi->getSPDInfoFrame(&spdVec, &ok).isOk() || !ok || spdVec.empty()) {
+            INT_ERROR("[srv-aidl] getSPDInfoFrame failed for port %d\n", (int)iHdmiPort);
+            return dsERR_GENERAL;
+        }
+        size_t copyLen = std::min(spdVec.size(), (size_t)HDMI_SRC_PRODUCT_DESC_MAX_LEN);
+        memcpy(spd, spdVec.data(), copyLen);
+        INT_INFO("[srv-aidl] getHDMISPDInfo port %d len=%zu\n", (int)iHdmiPort, copyLen);
+        return dsERR_NONE;
+    }
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetHDMISPDInfo_t)(dsHdmiInPort_t iHdmiPort, unsigned char *data);
     static dsGetHDMISPDInfo_t dsGetHDMISPDInfoFunc = 0;
@@ -342,6 +702,23 @@ static dsError_t getEdidVersion (dsHdmiInPort_t iHdmiPort, int *iEdidVersion) {
 }
 
 static dsError_t getAllmStatus (dsHdmiInPort_t iHdmiPort, bool *allmStatus) {
+    if (!s_aidlPorts.empty()) {
+        sp<IHDMIInput> hi;
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.find((int)iHdmiPort);
+            if (it == s_aidlPorts.end() || !it->second.hdmiInput) return dsERR_INVALID_PARAM;
+            hi = it->second.hdmiInput;
+        }
+        Capabilities caps;
+        if (!hi->getCapabilities(&caps).isOk()) {
+            INT_ERROR("[srv-aidl] getCapabilities failed for port %d\n", (int)iHdmiPort);
+            return dsERR_GENERAL;
+        }
+        *allmStatus = caps.supportsALLM;
+        INT_INFO("[srv-aidl] getAllmStatus port %d allm=%d\n", (int)iHdmiPort, *allmStatus);
+        return dsERR_NONE;
+    }
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetAllmStatus_t)(dsHdmiInPort_t iHdmiPort, bool *allmStatus);
     static dsGetAllmStatus_t dsGetAllmStatusFunc = 0;
@@ -373,6 +750,35 @@ static dsError_t getAllmStatus (dsHdmiInPort_t iHdmiPort, bool *allmStatus) {
 }
 
 static dsError_t getSupportedGameFeaturesList (dsSupportedGameFeatureList_t *fList) {
+    if (!s_aidlPorts.empty()) {
+        sp<IHDMIInput> hi;
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.begin();
+            if (it == s_aidlPorts.end() || !it->second.hdmiInput) return dsERR_INVALID_PARAM;
+            hi = it->second.hdmiInput;
+        }
+        Capabilities caps;
+        if (!hi->getCapabilities(&caps).isOk()) {
+            INT_ERROR("[srv-aidl] getCapabilities failed\n");
+            return dsERR_GENERAL;
+        }
+        fList->gameFeatureCount = 0;
+        if (caps.supportsALLM) {
+            strncpy(fList->gameFeatureList[fList->gameFeatureCount++], "allm",
+                sizeof(fList->gameFeatureList[0]) - 1);
+        }
+        if (caps.supportsVRR) {
+            strncpy(fList->gameFeatureList[fList->gameFeatureCount++], "vrr_hdmi",
+                sizeof(fList->gameFeatureList[0]) - 1);
+        }
+        if (caps.supportsFreeSync) {
+            strncpy(fList->gameFeatureList[fList->gameFeatureCount++], "freeSync",
+                sizeof(fList->gameFeatureList[0]) - 1);
+        }
+        INT_INFO("[srv-aidl] getSupportedGameFeaturesList count=%d\n", fList->gameFeatureCount);
+        return dsERR_NONE;
+    }
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetSupportedGameFeaturesList_t)(dsSupportedGameFeatureList_t *fList);
     static dsGetSupportedGameFeaturesList_t dsGetSupportedGameFeaturesListFunc = 0;
@@ -405,6 +811,26 @@ static dsError_t getSupportedGameFeaturesList (dsSupportedGameFeatureList_t *fLi
 
 static dsError_t getAVLatency_hal (int *audio_latency, int *video_latency)
 {
+    if (!s_aidlPorts.empty()) {
+        sp<IPlaneControl> pc = getAidlPlaneCtrl();
+        if (!pc) {
+            INT_ERROR("[srv-aidl] IPlaneControl unavailable\n");
+            *audio_latency = 0; *video_latency = 0;
+            return dsERR_NONE;
+        }
+        std::vector<::com::rdk::hal::planecontrol::PlaneCapabilities> planeCaps;
+        bool ok = false;
+        if (!pc->getCapabilities(&planeCaps, &ok).isOk() || !ok || planeCaps.empty()) {
+            INT_ERROR("[srv-aidl] PlaneControl getCapabilities failed\n");
+            *audio_latency = 0; *video_latency = 0;
+            return dsERR_NONE;
+        }
+        int latencyMs = planeCaps[0].vsyncDisplayLatency * 16;
+        *video_latency = latencyMs;
+        *audio_latency = 0;
+        INT_INFO("[srv-aidl] getAVLatency audio=0 video=%d\n", *video_latency);
+        return dsERR_NONE;
+    }
    dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetAVLatency_t)(int *audio_latency, int *video_latency);
     static dsGetAVLatency_t dsGetAVLatencyFunc = 0;
@@ -436,6 +862,30 @@ static dsError_t getAVLatency_hal (int *audio_latency, int *video_latency)
 }
 
 static dsError_t getHdmiVersion (dsHdmiInPort_t iHdmiPort, dsHdmiMaxCapabilityVersion_t  *capversion) {
+    if (!s_aidlPorts.empty()) {
+        sp<IHDMIInput> hi;
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.find((int)iHdmiPort);
+            if (it == s_aidlPorts.end() || !it->second.hdmiInput) return dsERR_INVALID_PARAM;
+            hi = it->second.hdmiInput;
+        }
+        Capabilities caps;
+        if (!hi->getCapabilities(&caps).isOk()) {
+            INT_ERROR("[srv-aidl] getCapabilities failed for port %d\n", (int)iHdmiPort);
+            return dsERR_GENERAL;
+        }
+        *capversion = HDMI_COMPATIBILITY_VERSION_14;
+        for (const auto& v : caps.supportedVersions) {
+            if (v == HDMIVersion::HDMI_2_1 && *capversion < HDMI_COMPATIBILITY_VERSION_21) {
+                *capversion = HDMI_COMPATIBILITY_VERSION_21;
+            } else if (v == HDMIVersion::HDMI_2_0 && *capversion < HDMI_COMPATIBILITY_VERSION_20) {
+                *capversion = HDMI_COMPATIBILITY_VERSION_20;
+            }
+        }
+        INT_INFO("[srv-aidl] getHdmiVersion port %d version=%d\n", (int)iHdmiPort, *capversion);
+        return dsERR_NONE;
+    }
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetHdmiVersion_t)(dsHdmiInPort_t iHdmiPort, dsHdmiMaxCapabilityVersion_t  *capversion);
     static dsGetHdmiVersion_t dsGetHdmiVersionFunc = 0;
@@ -492,17 +942,16 @@ IARM_Result_t _dsHdmiInInit(void *arg)
         INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
         if (!m_isPlatInitialized)
         {
-            /* Nexus init, if any here */
-            dsError_t eError = dsHdmiInInit();
+            aidlHdmiInInit();
         }
         m_isPlatInitialized++;
     }
 
     if (!m_isInitialized)
     {
-        if (PROFILE_TV == profileType)
+        if (PROFILE_TV == profileType && s_aidlPorts.empty())
         {
-            INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
+            INT_INFO("[%d][%s]: its TV Profile (HAL path)\r\n", __LINE__, __FUNCTION__);
             dsHdmiInRegisterConnectCB(_dsHdmiInConnectCB);
 
             typedef dsError_t (*dsHdmiInRegisterSignalChangeCB_t)(dsHdmiInSignalChangeCB_t CBFunc);
@@ -669,7 +1118,11 @@ IARM_Result_t _dsHdmiInInit(void *arg)
         int itr = 0;
         bool isARCCapable = false;
        
-        dsHdmiInGetNumberOfInputs(&noOfSupportedHdmiInputs);
+        if (!s_aidlPorts.empty()) {
+            noOfSupportedHdmiInputs = s_aidlPortCount;
+        } else if (PROFILE_TV == profileType) {
+            dsHdmiInGetNumberOfInputs(&noOfSupportedHdmiInputs);
+        }
         INT_INFO("Number of Inputs:%d \n",noOfSupportedHdmiInputs);
       
         for (itr = 0; itr < noOfSupportedHdmiInputs; itr++) {
@@ -785,7 +1238,11 @@ IARM_Result_t _dsHdmiInTerm(void *arg)
             m_isPlatInitialized--;
             if (!m_isPlatInitialized)
             {
-                dsHdmiInTerm();
+                if (!s_aidlPorts.empty()) {
+                    aidlHdmiInTerm();
+                } else {
+                    dsHdmiInTerm();
+                }
             }
         }
     }
@@ -803,16 +1260,17 @@ IARM_Result_t _dsHdmiInGetNumberOfInputs(void *arg)
 
     IARM_BUS_Lock(lock);
 
-    if (PROFILE_TV == profileType)
-    {
+    if (!s_aidlPorts.empty()) {
+        param->numHdmiInputs = s_aidlPortCount;
+        param->result = dsERR_NONE;
+    } else if (PROFILE_TV == profileType) {
         INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsHdmiInGetNumberOfInputs(&param->numHdmiInputs);
-    }
-    else
-    {
+    } else {
         INT_INFO("[%d][%s]: its Other Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsERR_GENERAL;
     }
+
     IARM_BUS_Unlock(lock);
 
     return IARM_RESULT_SUCCESS;
@@ -826,13 +1284,23 @@ IARM_Result_t _dsHdmiInGetStatus(void *arg)
 
     IARM_BUS_Lock(lock);
 
-    if (PROFILE_TV == profileType)
-    {
+    if (!s_aidlPorts.empty()) {
+        memset(&param->status, 0, sizeof(param->status));
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            param->status.activePort  = (dsHdmiInPort_t)s_aidlActivePort;
+            param->status.isPresented = (s_aidlActivePort >= 0);
+            for (auto& kv : s_aidlPorts) {
+                int idx = kv.first;
+                if (idx >= 0 && idx < dsHDMI_IN_PORT_MAX)
+                    param->status.isPortConnected[idx] = kv.second.connected;
+            }
+        }
+        param->result = dsERR_NONE;
+    } else if (PROFILE_TV == profileType) {
         INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsHdmiInGetStatus(&param->status);
-    }
-    else
-    {
+    } else {
         INT_INFO("[%d][%s]: its Other Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsERR_GENERAL;
     }
@@ -873,13 +1341,34 @@ IARM_Result_t _dsHdmiInScaleVideo(void *arg)
     IARM_BUS_Lock(lock);
     dsHdmiInScaleVideoParam_t *param = (dsHdmiInScaleVideoParam_t *)arg;
 
-    if (PROFILE_TV == profileType)
-    {
+    if (!s_aidlPorts.empty()) {
+        sp<IPlaneControl> pc = getAidlPlaneCtrl();
+        if (!pc) {
+            param->result = dsERR_GENERAL;
+        } else {
+            std::vector<::com::rdk::hal::planecontrol::PropertyKVPair> kvList;
+            ::com::rdk::hal::planecontrol::PropertyKVPair kv;
+            kv.property = ::com::rdk::hal::planecontrol::Property::X;
+            kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.x);
+            kvList.push_back(kv);
+            kv.property = ::com::rdk::hal::planecontrol::Property::Y;
+            kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.y);
+            kvList.push_back(kv);
+            kv.property = ::com::rdk::hal::planecontrol::Property::WIDTH;
+            kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.width);
+            kvList.push_back(kv);
+            kv.property = ::com::rdk::hal::planecontrol::Property::HEIGHT;
+            kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.height);
+            kvList.push_back(kv);
+            bool result = false;
+            ::android::binder::Status st = pc->setPropertyMultiAtomic(
+                HDMI_IN_PRIMARY_PLANE_INDEX, kvList, &result);
+            param->result = (st.isOk() && result) ? dsERR_NONE : dsERR_GENERAL;
+        }
+    } else if (PROFILE_TV == profileType) {
         INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsHdmiInScaleVideo(param->videoRect.x, param->videoRect.y, param->videoRect.width, param->videoRect.height);
-    }
-    else
-    {
+    } else {
         INT_INFO("[%d][%s]: its Other Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsERR_GENERAL;
     }
@@ -895,13 +1384,25 @@ IARM_Result_t _dsHdmiInSelectZoomMode(void *arg)
     IARM_BUS_Lock(lock);
     dsHdmiInSelectZoomModeParam_t *param = (dsHdmiInSelectZoomModeParam_t *)arg;
 
-    if (PROFILE_TV == profileType)
-    {
+    if (!s_aidlPorts.empty()) {
+        sp<IPlaneControl> pc = getAidlPlaneCtrl();
+        if (!pc) {
+            param->result = dsERR_GENERAL;
+        } else {
+            ::com::rdk::hal::PropertyValue aspectRatioVal;
+            aspectRatioVal.set<::com::rdk::hal::PropertyValue::Tag::intValue>(
+                (int32_t)param->zoomMode);
+            bool result = false;
+            ::android::binder::Status st = pc->setProperty(
+                HDMI_IN_PRIMARY_PLANE_INDEX,
+                ::com::rdk::hal::planecontrol::Property::ASPECT_RATIO,
+                aspectRatioVal, &result);
+            param->result = (st.isOk() && result) ? dsERR_NONE : dsERR_GENERAL;
+        }
+    } else if (PROFILE_TV == profileType) {
         INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsHdmiInSelectZoomMode(param->zoomMode);
-    }
-    else
-    {
+    } else {
         INT_INFO("[%d][%s]: its Other Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsERR_GENERAL;
     }
@@ -919,13 +1420,21 @@ IARM_Result_t _dsHdmiInGetCurrentVideoMode(void *arg)
 
     IARM_BUS_Lock(lock);
 
-    if (PROFILE_TV == profileType)
-    {
+    if (!s_aidlPorts.empty()) {
+        int vic = 0;
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            if (s_aidlActivePort >= 0) {
+                auto it = s_aidlPorts.find(s_aidlActivePort);
+                if (it != s_aidlPorts.end()) vic = it->second.lastVIC;
+            }
+        }
+        vicToResolutionObj_srv(vic, param->resolution);
+        param->result = dsERR_NONE;
+    } else if (PROFILE_TV == profileType) {
         INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsHdmiInGetCurrentVideoMode(&param->resolution);
-    }
-    else
-    {
+    } else {
         INT_INFO("[%d][%s]: its Other Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsERR_GENERAL;
     }
@@ -976,7 +1485,7 @@ void _dsHdmiInStatusChangeCB(dsHdmiInStatus_t inputStatus)
     IARM_Bus_BroadcastEvent(IARM_BUS_DSMGR_NAME,
                                 (IARM_EventId_t)IARM_BUS_DSMGR_EVENT_HDMI_IN_STATUS,
                                 (void *)&hdmi_in_status_eventData,
-                                sizeof(hdmi_in_status_eventData));
+[O                                sizeof(hdmi_in_status_eventData));
 
 }
 
@@ -1276,7 +1785,7 @@ void updateVRRBitValuesInPersistence(dsHdmiInPort_t iHdmiPort, bool vrrSupport)
 	  {	  
           std::string port_vrrSupport = "HDMI"+std::to_string(port_no)+".vrrEnable";
           device::HostPersistence::getInstance().persistHostProperty(port_vrrSupport, vrrSupport ? "TRUE" : "FALSE");
-          INT_INFO("Port HDMI%d: Persist EDID VRR Bit: %d\n", port_no, vrrSupport);
+[I          INT_INFO("Port HDMI%d: Persist EDID VRR Bit: %d\n", port_no, vrrSupport);
 	  }
 	  else
 	  {
@@ -1343,6 +1852,14 @@ IARM_Result_t _dsSetVRRSupport (void *arg)
 }
 
 static dsError_t getVRRSupport (dsHdmiInPort_t iHdmiPort, bool *vrrSupport) {
+    if (!s_aidlPorts.empty()) {
+        if ((int)iHdmiPort >= 0 && (int)iHdmiPort < dsHDMI_IN_PORT_MAX) {
+            *vrrSupport = m_hdmiPortVrrCaps[(int)iHdmiPort];
+            INT_INFO("[srv-aidl] getVRRSupport port %d vrr=%d\n", (int)iHdmiPort, *vrrSupport);
+            return dsERR_NONE;
+        }
+        return dsERR_INVALID_PARAM;
+    }
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsHdmiInGetVRRSupport_t)(dsHdmiInPort_t iHdmiPort, bool *vrrSupport);
     static dsHdmiInGetVRRSupport_t dsHdmiInGetVRRSupportFunc = 0;
@@ -1391,6 +1908,18 @@ IARM_Result_t _dsGetVRRSupport (void *arg)
 
 
 static dsError_t getVRRStatus (dsHdmiInPort_t iHdmiPort, dsHdmiInVrrStatus_t *vrrStatus) {
+    if (!s_aidlPorts.empty()) {
+        std::lock_guard<std::mutex> lk(s_aidlMutex);
+        auto it = s_aidlPorts.find((int)iHdmiPort);
+        if (it == s_aidlPorts.end()) return dsERR_INVALID_PARAM;
+        const AidlPortCtx& ctx = it->second;
+        vrrStatus->vrrType = ctx.vrrActive
+            ? (ctx.vrrFrameRate > 0.0 ? dsVRR_AMD_FREESYNC : dsVRR_HDMI_VRR)
+            : dsVRR_NONE;
+        vrrStatus->vrrAmdfreesyncFramerate_Hz = ctx.vrrActive ? ctx.vrrFrameRate : 0.0;
+        INT_INFO("[srv-aidl] getVRRStatus port %d type=%d\n", (int)iHdmiPort, vrrStatus->vrrType);
+        return dsERR_NONE;
+    }
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsHdmiInGetVRRStatus_t)(dsHdmiInPort_t iHdmiPort, dsHdmiInVrrStatus_t *vrrStatus);
     static dsHdmiInGetVRRStatus_t dsHdmiInGetVRRStatusFunc = 0;
@@ -1451,3 +1980,4 @@ IARM_Result_t _dsGetHdmiVersion (void *arg)
 }
 /** @} */
 /** @} */
+

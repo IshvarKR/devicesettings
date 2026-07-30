@@ -26,9 +26,20 @@ INCLUDE_FILES = -I=$(includedir)/rdk/halif/ds-hal \
                 -I=$(includedir)/rdk/iarmbus
 
 lib_LTLIBRARIES = libdshalsrv.la
-libdshalsrv_la_CPPFLAGS = $(INCLUDE_FILES)
+AIDL_CPPFLAGS_SRV = -I$(includedir)/rdk-halif-aidl \
+        -I$(includedir)/binder_sdk
+
+AIDL_LIBS_SRV = -L$(libdir)/rdk-halif-aidl \
+        -lhdmiinput-vcurrent-cpp \
+        -lplanecontrol-vcurrent-cpp \
+        -lcommon-vcurrent-cpp \
+        -lbinder \
+        -lutils
+
+libdshalsrv_la_CPPFLAGS = $(INCLUDE_FILES) $(AIDL_CPPFLAGS_SRV)
 libdshalsrv_la_CXXFLAGS= -std=c++0x -g -fPIC -D_REENTRANT -Wall
 libdshalsrv_la_CFLAGS = -x c++ -g -fPIC -D_REENTRANT -Wall
 libdshalsrv_la_SOURCES = dsHost.cpp hostPersistence.cpp dsAudio.c dsDisplay.c dsFPD.c dsMgr.c dsVideoDevice.c dsVideoPort.c dsserverlogger.c \
                          dsConfigs.c dsAudioConfig.c dsVideoPortConfig.c dsVideoDeviceConfig.c dsCompositeIn.c dsHdmiIn.c
-libdshalsrv_la_LIBADD = -ldl -ltelemetry_msgsender
+libdshalsrv_la_LIBADD = -ldl -ltelemetry_msgsender $(AIDL_LIBS_SRV)
+
