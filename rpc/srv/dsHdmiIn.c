@@ -80,7 +80,7 @@
 #define IARM_BUS_Lock(lock) pthread_mutex_lock(&fpLock)
 #define IARM_BUS_Unlock(lock) pthread_mutex_unlock(&fpLock)
 #define TVSETTINGS_DALS_RFC_PARAM "Device.DeviceInfo.X_RDKCENTRAL-COM_RFC.Feature.TvSettings.DynamicAutoLatency"
-[O
+
 static bool isDalsEnabled = false;
 static int m_isInitialized = 0;
 static int m_isPlatInitialized=0;
@@ -260,6 +260,60 @@ static void vicToResolutionObj_srv(int vic, dsVideoPortResolution_t& res)
     }
 }
 
+static bool parseAidlAviContentType(const std::vector<uint8_t>& infoFrame, dsAviContentType_t* contentType)
+{
+    static const uint8_t kAviInfoFrameType = 0x82;
+    static const size_t kAviHeaderAndChecksumLen = 4;
+    static const size_t kAviMinFrameLenForContentType = 9;
+
+    if (!contentType) {
+        return false;
+    }
+
+    *contentType = dsAVICONTENT_TYPE_NOT_SIGNALLED;
+
+    if (infoFrame.size() < kAviMinFrameLenForContentType) {
+        return false;
+    }
+
+    if (infoFrame[0] != kAviInfoFrameType) {
+        return false;
+    }
+
+    uint8_t payloadLength = infoFrame[2];
+    if (payloadLength < 5 || infoFrame.size() < (kAviHeaderAndChecksumLen + payloadLength)) {
+        return false;
+    }
+
+    const uint8_t aviDataByte3 = infoFrame[6];
+    const uint8_t aviDataByte5 = infoFrame[8];
+    const bool isItContent = (aviDataByte3 & 0x80) != 0;
+
+    if (!isItContent) {
+        return true;
+    }
+
+    switch ((aviDataByte5 >> 4) & 0x03) {
+        case 0:
+            *contentType = dsAVICONTENT_TYPE_GRAPHICS;
+            break;
+        case 1:
+            *contentType = dsAVICONTENT_TYPE_PHOTO;
+            break;
+        case 2:
+            *contentType = dsAVICONTENT_TYPE_CINEMA;
+            break;
+        case 3:
+            *contentType = dsAVICONTENT_TYPE_GAME;
+            break;
+        default:
+            *contentType = dsAVICONTENT_TYPE_NOT_SIGNALLED;
+            break;
+    }
+
+    return true;
+}
+
 // ---- AIDL listener: per-port IHDMIInputController callbacks ----
 class SrvHdmiCtrlListener
     : public ::com::rdk::hal::hdmiinput::BnHDMIInputControllerListener
@@ -323,8 +377,17 @@ public:
         return ::android::binder::Status::ok();
     }
 
-    ::android::binder::Status onAVIInfoFrame(const std::vector<uint8_t>&) override
-        { return ::android::binder::Status::ok(); }
+    ::android::binder::Status onAVIInfoFrame(const std::vector<uint8_t>& data) override {
+        dsAviContentType_t contentType = dsAVICONTENT_TYPE_NOT_SIGNALLED;
+        if (!parseAidlAviContentType(data, &contentType)) {
+            INT_INFO("[srv-aidl] port %d ignoring malformed AVI InfoFrame len=%zu\n", m_portId, data.size());
+            return ::android::binder::Status::ok();
+        }
+
+        INT_INFO("[srv-aidl] port %d AVI content type=%d\n", m_portId, (int)contentType);
+        _dsHdmiInAviContentTypeChangeCB((dsHdmiInPort_t)m_portId, contentType);
+        return ::android::binder::Status::ok();
+    }
     ::android::binder::Status onAudioInfoFrame(const std::vector<uint8_t>&) override
         { return ::android::binder::Status::ok(); }
     ::android::binder::Status onSPDInfoFrame(const std::vector<uint8_t>&) override
@@ -468,7 +531,7 @@ void getDynamicAutoLatencyConfig()
 }
 
 static dsError_t isHdmiARCPort (int iPort, bool* isArcEnabled) {
-[I    if (!s_aidlPorts.empty()) {
+    if (!s_aidlPorts.empty()) {
         if (iPort >= 0 && iPort < dsHDMI_IN_PORT_MAX) {
             *isArcEnabled = s_aidlPortArcCapable[iPort];
             INT_INFO("[srv-aidl] isHdmiARCPort port %d arc=%d\n", iPort, *isArcEnabled);
@@ -476,6 +539,7 @@ static dsError_t isHdmiARCPort (int iPort, bool* isArcEnabled) {
         }
         return dsERR_INVALID_PARAM;
     }
+#if 0
     dsError_t eRet = dsERR_GENERAL; 
 
     typedef bool (*dsIsHdmiARCPort_t)(int iPortArg, bool *boolArg);
@@ -507,6 +571,8 @@ static dsError_t isHdmiARCPort (int iPort, bool* isArcEnabled) {
         INT_INFO("%s: dsIsHdmiARCPort  dsIsHdmiARCPortFunc = %p\n", __FUNCTION__, dsIsHdmiARCPortFunc);
     }
     return eRet;
+#endif
+    return dsERR_GENERAL;
 }
 
 static dsError_t getEDIDBytesInfo (dsHdmiInPort_t iHdmiPort, unsigned char *edid, int *length) {
@@ -529,6 +595,7 @@ static dsError_t getEDIDBytesInfo (dsHdmiInPort_t iHdmiPort, unsigned char *edid
         INT_INFO("[srv-aidl] getEDIDBytesInfo port %d len=%d\n", (int)iHdmiPort, *length);
         return dsERR_NONE;
     }
+#if 0
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetEDIDBytesInfo_t)(dsHdmiInPort_t iHdmiPort, unsigned char *edid, int *length);
     static dsGetEDIDBytesInfo_t dsGetEDIDBytesInfoFunc = 0;
@@ -557,6 +624,8 @@ static dsError_t getEDIDBytesInfo (dsHdmiInPort_t iHdmiPort, unsigned char *edid
         INT_INFO("[srv] %s: dsGetEDIDBytesInfoFunc eRet: %d data len: %d \r\n", __FUNCTION__,eRet, *length);
     }
     return eRet;
+#endif
+    return dsERR_GENERAL;
 }
 
 static dsError_t getHDMISPDInfo (dsHdmiInPort_t iHdmiPort, unsigned char *spd) {
@@ -574,11 +643,13 @@ static dsError_t getHDMISPDInfo (dsHdmiInPort_t iHdmiPort, unsigned char *spd) {
             INT_ERROR("[srv-aidl] getSPDInfoFrame failed for port %d\n", (int)iHdmiPort);
             return dsERR_GENERAL;
         }
-        size_t copyLen = std::min(spdVec.size(), (size_t)HDMI_SRC_PRODUCT_DESC_MAX_LEN);
+        memset(spd, 0, sizeof(struct dsSpd_infoframe_st));
+        size_t copyLen = std::min(spdVec.size(), sizeof(struct dsSpd_infoframe_st));
         memcpy(spd, spdVec.data(), copyLen);
         INT_INFO("[srv-aidl] getHDMISPDInfo port %d len=%zu\n", (int)iHdmiPort, copyLen);
         return dsERR_NONE;
     }
+#if 0
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetHDMISPDInfo_t)(dsHdmiInPort_t iHdmiPort, unsigned char *data);
     static dsGetHDMISPDInfo_t dsGetHDMISPDInfoFunc = 0;
@@ -609,9 +680,158 @@ static dsError_t getHDMISPDInfo (dsHdmiInPort_t iHdmiPort, unsigned char *spd) {
         INT_INFO("%s:  dsGetHDMISPDInfoFunc = %p\n", __FUNCTION__, dsGetHDMISPDInfoFunc);
     }
     return eRet;
+#endif
+    return dsERR_GENERAL;
+}
+
+static tv_hdmi_edid_version_t getAidlEdidVersion(const std::vector<uint8_t>& edidVec)
+{
+    static const uint8_t kEdidHeader[] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+    static const uint8_t kCtaExtensionTag = 0x02;
+    static const uint8_t kVendorSpecificDataBlockTag = 0x03;
+    static const uint8_t kHdmiForumOui0[] = {0xD8, 0x5D, 0xC4};
+
+    if (edidVec.size() < 128 || memcmp(edidVec.data(), kEdidHeader, sizeof(kEdidHeader)) != 0) {
+        return HDMI_EDID_VER_MAX;
+    }
+
+    uint8_t extensionCount = edidVec[126];
+    size_t availableExtensions = (edidVec.size() / 128);
+    if (availableExtensions == 0) {
+        return HDMI_EDID_VER_MAX;
+    }
+    if (extensionCount > (availableExtensions - 1)) {
+        return HDMI_EDID_VER_MAX;
+    }
+
+    for (uint8_t extIndex = 0; extIndex < extensionCount; ++extIndex) {
+        size_t base = static_cast<size_t>(extIndex + 1) * 128;
+        if ((base + 128) > edidVec.size()) {
+            return HDMI_EDID_VER_MAX;
+        }
+        if (edidVec[base] != kCtaExtensionTag) {
+            continue;
+        }
+
+        uint8_t dtdOffset = edidVec[base + 2];
+        if (dtdOffset < 4 || dtdOffset > 127) {
+            return HDMI_EDID_VER_MAX;
+        }
+
+        size_t idx = base + 4;
+        size_t end = base + dtdOffset;
+        while (idx < end) {
+            uint8_t tagLen = edidVec[idx];
+            uint8_t blockTag = static_cast<uint8_t>((tagLen >> 5) & 0x07);
+            uint8_t blockLen = static_cast<uint8_t>(tagLen & 0x1F);
+            size_t payloadStart = idx + 1;
+            size_t payloadEnd = payloadStart + blockLen;
+            if (payloadEnd > end) {
+                return HDMI_EDID_VER_MAX;
+            }
+
+            if (blockTag == kVendorSpecificDataBlockTag && blockLen >= 3 &&
+                memcmp(&edidVec[payloadStart], kHdmiForumOui0, sizeof(kHdmiForumOui0)) == 0) {
+                return HDMI_EDID_VER_20;
+            }
+
+            idx = payloadEnd;
+        }
+    }
+
+    return HDMI_EDID_VER_14;
+}
+
+static bool mapLegacyEdidVersionToAidl(tv_hdmi_edid_version_t iEdidVersion, HDMIVersion* aidlVersion)
+{
+    if (!aidlVersion) {
+        return false;
+    }
+
+    switch (iEdidVersion) {
+        case HDMI_EDID_VER_14:
+            *aidlVersion = HDMIVersion::HDMI_1_4;
+            return true;
+        case HDMI_EDID_VER_20:
+            *aidlVersion = HDMIVersion::HDMI_2_0;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool isAidlEdidVersionSupported(const Capabilities& caps, HDMIVersion version)
+{
+    return std::find(caps.supportedVersions.begin(), caps.supportedVersions.end(), version) != caps.supportedVersions.end();
 }
 
 static dsError_t setEdidVersion (dsHdmiInPort_t iHdmiPort, tv_hdmi_edid_version_t iEdidVersion) {
+    if (!s_aidlPorts.empty()) {
+        HDMIVersion aidlVersion;
+        if (!mapLegacyEdidVersionToAidl(iEdidVersion, &aidlVersion)) {
+            return dsERR_INVALID_PARAM;
+        }
+
+        sp<IHDMIInput> hi;
+        sp<IHDMIInputController> ctrl;
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.find((int)iHdmiPort);
+            if (it == s_aidlPorts.end() || !it->second.hdmiInput || !it->second.controller) {
+                return dsERR_INVALID_PARAM;
+            }
+            hi = it->second.hdmiInput;
+            ctrl = it->second.controller;
+        }
+
+        Capabilities caps;
+        if (!hi->getCapabilities(&caps).isOk()) {
+            INT_ERROR("[srv-aidl] getCapabilities failed for port %d\n", (int)iHdmiPort);
+            return dsERR_GENERAL;
+        }
+
+        if (!isAidlEdidVersionSupported(caps, aidlVersion)) {
+            INT_INFO("[srv-aidl] setEdidVersion port %d unsupported requested version=%d\n", (int)iHdmiPort, (int)aidlVersion);
+            return dsERR_OPERATION_NOT_SUPPORTED;
+        }
+
+        std::vector<uint8_t> edidVec;
+        bool ok = false;
+        if (!hi->getDefaultEDID(aidlVersion, &edidVec, &ok).isOk() || !ok || edidVec.size() < 128) {
+            INT_ERROR("[srv-aidl] getDefaultEDID failed for port %d version=%d\n", (int)iHdmiPort, (int)aidlVersion);
+            return dsERR_GENERAL;
+        }
+
+        // Apply only the base default EDID here. ALLM/VRR-dependent EDID bit mutation needs a
+        // follow-up implementation once the required AIDL-side behavior is clarified.
+        ok = false;
+        if (!ctrl->setEDID(edidVec, &ok).isOk() || !ok) {
+            INT_ERROR("[srv-aidl] setEDID failed for port %d version=%d\n", (int)iHdmiPort, (int)aidlVersion);
+            return dsERR_GENERAL;
+        }
+
+        int port_no = (int)iHdmiPort;
+        if ((port_no >= 0) && (port_no < noOfSupportedHdmiInputs)) {
+            char edidVer[2];
+            sprintf(edidVer, "%d\0", iEdidVersion);
+            std::string port_edidVer = "HDMI" + std::to_string(port_no) + ".edidversion";
+            device::HostPersistence::getInstance().persistHostProperty(port_edidVer, edidVer);
+            INT_INFO("Port HDMI%d: Persist EDID Version: %d\n", port_no, iEdidVersion);
+            m_edidversion[port_no] = iEdidVersion;
+        } else {
+            INT_INFO("Invalid port number to update in persistence\n");
+        }
+
+        if (iEdidVersion == HDMI_EDID_VER_20 &&
+            (m_edidallmsupport[iHdmiPort] || (m_hdmiPortVrrCaps[iHdmiPort] && m_vrrsupport[iHdmiPort]))) {
+            INT_INFO("[srv-aidl] setEdidVersion port %d applied base EDID only; ALLM/VRR EDID bit updates remain pending clarification\n", (int)iHdmiPort);
+        }
+
+        INT_INFO("[srv-aidl] setEdidVersion port %d version=%d\n", (int)iHdmiPort, iEdidVersion);
+        return dsERR_NONE;
+    }
+
+#if 0
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsSetEdidVersion_t)(dsHdmiInPort_t iHdmiPort, tv_hdmi_edid_version_t iEdidVersion);
     static dsSetEdidVersion_t dsSetEdidVersionFunc = 0;
@@ -665,9 +885,43 @@ static dsError_t setEdidVersion (dsHdmiInPort_t iHdmiPort, tv_hdmi_edid_version_
         INT_INFO("%s:  dsSetEdidVersionFunc = %p\n", __FUNCTION__, dsSetEdidVersionFunc);
     }
     return eRet;
+#endif
+    INT_INFO("[%d][%s]: inline HAL fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
+    return dsERR_GENERAL;
 }
 
 static dsError_t getEdidVersion (dsHdmiInPort_t iHdmiPort, int *iEdidVersion) {
+    // TODO: Confirm if this is correct. Infer the HDMI EDID mode from the current
+    // AIDL EDID bytes returned by IHDMIInput::getEDID().
+    if (!s_aidlPorts.empty()) {
+        if (!iEdidVersion) {
+            return dsERR_INVALID_PARAM;
+        }
+
+        sp<IHDMIInput> hi;
+        {
+            std::lock_guard<std::mutex> lk(s_aidlMutex);
+            auto it = s_aidlPorts.find((int)iHdmiPort);
+            if (it == s_aidlPorts.end() || !it->second.hdmiInput) {
+                return dsERR_INVALID_PARAM;
+            }
+            hi = it->second.hdmiInput;
+        }
+
+        std::vector<uint8_t> edidVec;
+        bool ok = false;
+        if (!hi->getEDID(&edidVec, &ok).isOk() || !ok || edidVec.size() < 128) {
+            INT_ERROR("[srv-aidl] getEDID failed for port %d\n", (int)iHdmiPort);
+            return dsERR_GENERAL;
+        }
+
+        tv_hdmi_edid_version_t edidVersion = getAidlEdidVersion(edidVec);
+        *iEdidVersion = static_cast<int>(edidVersion);
+        INT_INFO("[srv-aidl] getEdidVersion port %d version=%d\n", (int)iHdmiPort, *iEdidVersion);
+        return dsERR_NONE;
+    }
+
+#if 0
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetEdidVersion_t)(dsHdmiInPort_t iHdmiPort, tv_hdmi_edid_version_t *iEdidVersion);
     static dsGetEdidVersion_t dsGetEdidVersionFunc = 0;
@@ -699,6 +953,9 @@ static dsError_t getEdidVersion (dsHdmiInPort_t iHdmiPort, int *iEdidVersion) {
         INT_INFO("%s:  dsGetEdidVersionFunc = %p\n", __FUNCTION__, dsGetEdidVersionFunc);
     }
     return eRet;
+#endif
+    INT_INFO("[%d][%s]: inline HAL fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
+    return dsERR_GENERAL;
 }
 
 static dsError_t getAllmStatus (dsHdmiInPort_t iHdmiPort, bool *allmStatus) {
@@ -719,6 +976,7 @@ static dsError_t getAllmStatus (dsHdmiInPort_t iHdmiPort, bool *allmStatus) {
         INT_INFO("[srv-aidl] getAllmStatus port %d allm=%d\n", (int)iHdmiPort, *allmStatus);
         return dsERR_NONE;
     }
+#if 0
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetAllmStatus_t)(dsHdmiInPort_t iHdmiPort, bool *allmStatus);
     static dsGetAllmStatus_t dsGetAllmStatusFunc = 0;
@@ -747,38 +1005,97 @@ static dsError_t getAllmStatus (dsHdmiInPort_t iHdmiPort, bool *allmStatus) {
         INT_INFO("%s:  dsGetAllmStatusFunc = %p\n", __FUNCTION__, dsGetAllmStatusFunc);
     }
     return eRet;
+#endif
+    return dsERR_GENERAL;
 }
 
 static dsError_t getSupportedGameFeaturesList (dsSupportedGameFeatureList_t *fList) {
     if (!s_aidlPorts.empty()) {
-        sp<IHDMIInput> hi;
+        if (!fList) {
+            return dsERR_INVALID_PARAM;
+        }
+
+        std::vector<sp<IHDMIInput>> hdmiInputs;
         {
             std::lock_guard<std::mutex> lk(s_aidlMutex);
-            auto it = s_aidlPorts.begin();
-            if (it == s_aidlPorts.end() || !it->second.hdmiInput) return dsERR_INVALID_PARAM;
-            hi = it->second.hdmiInput;
+            if (s_aidlPorts.empty()) {
+                return dsERR_INVALID_PARAM;
+            }
+            for (const auto& kv : s_aidlPorts) {
+                if (kv.second.hdmiInput) {
+                    hdmiInputs.push_back(kv.second.hdmiInput);
+                }
+            }
         }
-        Capabilities caps;
-        if (!hi->getCapabilities(&caps).isOk()) {
-            INT_ERROR("[srv-aidl] getCapabilities failed\n");
-            return dsERR_GENERAL;
+
+        if (hdmiInputs.empty()) {
+            return dsERR_INVALID_PARAM;
         }
-        fList->gameFeatureCount = 0;
-        if (caps.supportsALLM) {
-            strncpy(fList->gameFeatureList[fList->gameFeatureCount++], "allm",
-                sizeof(fList->gameFeatureList[0]) - 1);
+
+        bool supportsAllm = false;
+        bool supportsVrr = false;
+        bool supportsFreeSync = false;
+        for (const auto& hi : hdmiInputs) {
+            Capabilities caps;
+            if (!hi->getCapabilities(&caps).isOk()) {
+                INT_ERROR("[srv-aidl] getCapabilities failed\n");
+                return dsERR_GENERAL;
+            }
+            supportsAllm = supportsAllm || caps.supportsALLM;
+            supportsVrr = supportsVrr || caps.supportsVRR;
+            supportsFreeSync = supportsFreeSync || caps.supportsFreeSync;
         }
-        if (caps.supportsVRR) {
-            strncpy(fList->gameFeatureList[fList->gameFeatureCount++], "vrr_hdmi",
-                sizeof(fList->gameFeatureList[0]) - 1);
+
+        FreeSync freeSyncTier = FreeSync::UNSUPPORTED;
+        if (supportsFreeSync) {
+            sp<IHDMIInputManager> mgr = getAidlHdmiMgr();
+            if (mgr) {
+                PlatformCapabilities platformCaps;
+                if (mgr->getCapabilities(&platformCaps).isOk()) {
+                    freeSyncTier = platformCaps.freeSync;
+                }
+            }
         }
-        if (caps.supportsFreeSync) {
-            strncpy(fList->gameFeatureList[fList->gameFeatureCount++], "freeSync",
-                sizeof(fList->gameFeatureList[0]) - 1);
+
+        std::vector<std::string> features;
+        if (supportsAllm) {
+            features.emplace_back("allm");
         }
-        INT_INFO("[srv-aidl] getSupportedGameFeaturesList count=%d\n", fList->gameFeatureCount);
+        if (supportsVrr) {
+            features.emplace_back("vrr_hdmi");
+        }
+        if (supportsFreeSync) {
+            switch (freeSyncTier) {
+                case FreeSync::FREESYNC_PREMIUM:
+                    features.emplace_back("vrr_amd_freesync_premium");
+                    break;
+                case FreeSync::FREESYNC_PREMIUM_PRO:
+                    features.emplace_back("vrr_amd_freesync_premium_pro");
+                    break;
+                case FreeSync::FREESYNC:
+                case FreeSync::UNSUPPORTED:
+                default:
+                    features.emplace_back("vrr_amd_freesync");
+                    break;
+            }
+        }
+
+        memset(fList, 0, sizeof(*fList));
+        fList->gameFeatureCount = (int)features.size();
+        std::string featureCsv;
+        for (size_t i = 0; i < features.size(); ++i) {
+            if (i != 0) {
+                featureCsv += ",";
+            }
+            featureCsv += features[i];
+        }
+        strncpy(fList->gameFeatureList, featureCsv.c_str(), sizeof(fList->gameFeatureList) - 1);
+
+        INT_INFO("[srv-aidl] getSupportedGameFeaturesList count=%d list=%s\n",
+            fList->gameFeatureCount, fList->gameFeatureList);
         return dsERR_NONE;
     }
+#if 0
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetSupportedGameFeaturesList_t)(dsSupportedGameFeatureList_t *fList);
     static dsGetSupportedGameFeaturesList_t dsGetSupportedGameFeaturesListFunc = 0;
@@ -807,6 +1124,8 @@ static dsError_t getSupportedGameFeaturesList (dsSupportedGameFeatureList_t *fLi
         INT_INFO("%s:  dsGetSupportedGameFeaturesListFunc = %p\n", __FUNCTION__, dsGetSupportedGameFeaturesListFunc);
     }
     return eRet;
+#endif
+    return dsERR_GENERAL;
 }
 
 static dsError_t getAVLatency_hal (int *audio_latency, int *video_latency)
@@ -831,6 +1150,7 @@ static dsError_t getAVLatency_hal (int *audio_latency, int *video_latency)
         INT_INFO("[srv-aidl] getAVLatency audio=0 video=%d\n", *video_latency);
         return dsERR_NONE;
     }
+#if 0
    dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetAVLatency_t)(int *audio_latency, int *video_latency);
     static dsGetAVLatency_t dsGetAVLatencyFunc = 0;
@@ -859,6 +1179,8 @@ static dsError_t getAVLatency_hal (int *audio_latency, int *video_latency)
         INT_INFO("%s:  dsGetAVLatencyFunc = %p\n", __FUNCTION__, dsGetAVLatencyFunc);
                }
        return eRet;
+#endif
+    return dsERR_GENERAL;
 }
 
 static dsError_t getHdmiVersion (dsHdmiInPort_t iHdmiPort, dsHdmiMaxCapabilityVersion_t  *capversion) {
@@ -886,6 +1208,7 @@ static dsError_t getHdmiVersion (dsHdmiInPort_t iHdmiPort, dsHdmiMaxCapabilityVe
         INT_INFO("[srv-aidl] getHdmiVersion port %d version=%d\n", (int)iHdmiPort, *capversion);
         return dsERR_NONE;
     }
+#if 0
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsGetHdmiVersion_t)(dsHdmiInPort_t iHdmiPort, dsHdmiMaxCapabilityVersion_t  *capversion);
     static dsGetHdmiVersion_t dsGetHdmiVersionFunc = 0;
@@ -913,6 +1236,8 @@ static dsError_t getHdmiVersion (dsHdmiInPort_t iHdmiPort, dsHdmiMaxCapabilityVe
         INT_INFO("[srv] %s: dsGetHdmiVersionFunc eRet: %d \r\n", __FUNCTION__,eRet);
     }
     return eRet;
+#endif
+    return dsERR_GENERAL;
 }
 
 IARM_Result_t dsHdmiInMgr_init()
@@ -951,6 +1276,7 @@ IARM_Result_t _dsHdmiInInit(void *arg)
     {
         if (PROFILE_TV == profileType && s_aidlPorts.empty())
         {
+#if 0
             INT_INFO("[%d][%s]: its TV Profile (HAL path)\r\n", __LINE__, __FUNCTION__);
             dsHdmiInRegisterConnectCB(_dsHdmiInConnectCB);
 
@@ -1091,7 +1417,8 @@ IARM_Result_t _dsHdmiInInit(void *arg)
             if(AVLatencyCBFunc && isDalsEnabled) {
                 AVLatencyCBFunc(_dsHdmiInAVLatencyChangeCB);
            }
-    
+#endif
+            INT_INFO("[%d][%s]: inline HAL init/callback fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
         }
 
         IARM_Bus_RegisterCall(IARM_BUS_DSMGR_API_dsHdmiInTerm,                  _dsHdmiInTerm);
@@ -1121,7 +1448,10 @@ IARM_Result_t _dsHdmiInInit(void *arg)
         if (!s_aidlPorts.empty()) {
             noOfSupportedHdmiInputs = s_aidlPortCount;
         } else if (PROFILE_TV == profileType) {
+#if 0
             dsHdmiInGetNumberOfInputs(&noOfSupportedHdmiInputs);
+#endif
+            INT_INFO("[%d][%s]: HDMI input count fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
         }
         INT_INFO("Number of Inputs:%d \n",noOfSupportedHdmiInputs);
       
@@ -1241,7 +1571,10 @@ IARM_Result_t _dsHdmiInTerm(void *arg)
                 if (!s_aidlPorts.empty()) {
                     aidlHdmiInTerm();
                 } else {
+#if 0
                     dsHdmiInTerm();
+#endif
+                    INT_INFO("[%d][%s]: inline HAL term fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
                 }
             }
         }
@@ -1260,12 +1593,17 @@ IARM_Result_t _dsHdmiInGetNumberOfInputs(void *arg)
 
     IARM_BUS_Lock(lock);
 
-    if (!s_aidlPorts.empty()) {
-        param->numHdmiInputs = s_aidlPortCount;
-        param->result = dsERR_NONE;
-    } else if (PROFILE_TV == profileType) {
-        INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
-        param->result = dsHdmiInGetNumberOfInputs(&param->numHdmiInputs);
+    if (PROFILE_TV == profileType) {
+        if (!s_aidlPorts.empty()) {
+            param->numHdmiInputs = s_aidlPortCount;
+            param->result = dsERR_NONE;
+        } else {
+            INT_INFO("[%d][%s]: inline HAL fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
+#if 0
+            param->result = dsHdmiInGetNumberOfInputs(&param->numHdmiInputs);
+#endif
+            param->result = dsERR_GENERAL;
+        }
     } else {
         INT_INFO("[%d][%s]: its Other Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsERR_GENERAL;
@@ -1284,22 +1622,27 @@ IARM_Result_t _dsHdmiInGetStatus(void *arg)
 
     IARM_BUS_Lock(lock);
 
-    if (!s_aidlPorts.empty()) {
-        memset(&param->status, 0, sizeof(param->status));
-        {
-            std::lock_guard<std::mutex> lk(s_aidlMutex);
-            param->status.activePort  = (dsHdmiInPort_t)s_aidlActivePort;
-            param->status.isPresented = (s_aidlActivePort >= 0);
-            for (auto& kv : s_aidlPorts) {
-                int idx = kv.first;
-                if (idx >= 0 && idx < dsHDMI_IN_PORT_MAX)
-                    param->status.isPortConnected[idx] = kv.second.connected;
+    if (PROFILE_TV == profileType) {
+        if (!s_aidlPorts.empty()) {
+            memset(&param->status, 0, sizeof(param->status));
+            {
+                std::lock_guard<std::mutex> lk(s_aidlMutex);
+                param->status.activePort  = (dsHdmiInPort_t)s_aidlActivePort;
+                param->status.isPresented = (s_aidlActivePort >= 0);
+                for (auto& kv : s_aidlPorts) {
+                    int idx = kv.first;
+                    if (idx >= 0 && idx < dsHDMI_IN_PORT_MAX)
+                        param->status.isPortConnected[idx] = kv.second.connected;
+                }
             }
+            param->result = dsERR_NONE;
+        } else {
+            INT_INFO("[%d][%s]: inline HAL fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
+#if 0
+            param->result = dsHdmiInGetStatus(&param->status);
+#endif
+            param->result = dsERR_GENERAL;
         }
-        param->result = dsERR_NONE;
-    } else if (PROFILE_TV == profileType) {
-        INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
-        param->result = dsHdmiInGetStatus(&param->status);
     } else {
         INT_INFO("[%d][%s]: its Other Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsERR_GENERAL;
@@ -1310,6 +1653,8 @@ IARM_Result_t _dsHdmiInGetStatus(void *arg)
     return IARM_RESULT_SUCCESS;
 }
 
+// selectPort() is on hold for the AIDL path until PlaneControl plane selection,
+// top-most behavior, and AudioMixer-backed requestAudioMix handling are defined.
 IARM_Result_t _dsHdmiInSelectPort(void *arg)
 {
     _DEBUG_ENTER();
@@ -1318,6 +1663,8 @@ IARM_Result_t _dsHdmiInSelectPort(void *arg)
 
     IARM_BUS_Lock(lock);
 
+    // Kept for reference while the API remains intentionally disabled.
+#if 0
     if (PROFILE_TV == profileType)
     {
         INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
@@ -1328,6 +1675,9 @@ IARM_Result_t _dsHdmiInSelectPort(void *arg)
         INT_INFO("[%d][%s]: its Other Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsERR_GENERAL;
     }
+#endif
+    INT_INFO("[%d][%s]: selectPort on hold pending PlaneControl and AudioMixer dependency resolution\r\n", __LINE__, __FUNCTION__);
+    param->result = dsERR_OPERATION_NOT_SUPPORTED;
 
     IARM_BUS_Unlock(lock);
 
@@ -1341,33 +1691,38 @@ IARM_Result_t _dsHdmiInScaleVideo(void *arg)
     IARM_BUS_Lock(lock);
     dsHdmiInScaleVideoParam_t *param = (dsHdmiInScaleVideoParam_t *)arg;
 
-    if (!s_aidlPorts.empty()) {
-        sp<IPlaneControl> pc = getAidlPlaneCtrl();
-        if (!pc) {
-            param->result = dsERR_GENERAL;
+    if (PROFILE_TV == profileType) {
+        if (!s_aidlPorts.empty()) {
+            sp<IPlaneControl> pc = getAidlPlaneCtrl();
+            if (!pc) {
+                param->result = dsERR_GENERAL;
+            } else {
+                std::vector<::com::rdk::hal::planecontrol::PropertyKVPair> kvList;
+                ::com::rdk::hal::planecontrol::PropertyKVPair kv;
+                kv.property = ::com::rdk::hal::planecontrol::Property::X;
+                kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.x);
+                kvList.push_back(kv);
+                kv.property = ::com::rdk::hal::planecontrol::Property::Y;
+                kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.y);
+                kvList.push_back(kv);
+                kv.property = ::com::rdk::hal::planecontrol::Property::WIDTH;
+                kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.width);
+                kvList.push_back(kv);
+                kv.property = ::com::rdk::hal::planecontrol::Property::HEIGHT;
+                kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.height);
+                kvList.push_back(kv);
+                bool result = false;
+                ::android::binder::Status st = pc->setPropertyMultiAtomic(
+                    HDMI_IN_PRIMARY_PLANE_INDEX, kvList, &result);
+                param->result = (st.isOk() && result) ? dsERR_NONE : dsERR_GENERAL;
+            }
         } else {
-            std::vector<::com::rdk::hal::planecontrol::PropertyKVPair> kvList;
-            ::com::rdk::hal::planecontrol::PropertyKVPair kv;
-            kv.property = ::com::rdk::hal::planecontrol::Property::X;
-            kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.x);
-            kvList.push_back(kv);
-            kv.property = ::com::rdk::hal::planecontrol::Property::Y;
-            kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.y);
-            kvList.push_back(kv);
-            kv.property = ::com::rdk::hal::planecontrol::Property::WIDTH;
-            kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.width);
-            kvList.push_back(kv);
-            kv.property = ::com::rdk::hal::planecontrol::Property::HEIGHT;
-            kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.height);
-            kvList.push_back(kv);
-            bool result = false;
-            ::android::binder::Status st = pc->setPropertyMultiAtomic(
-                HDMI_IN_PRIMARY_PLANE_INDEX, kvList, &result);
-            param->result = (st.isOk() && result) ? dsERR_NONE : dsERR_GENERAL;
+            INT_INFO("[%d][%s]: inline HAL fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
+#if 0
+            param->result = dsHdmiInScaleVideo(param->videoRect.x, param->videoRect.y, param->videoRect.width, param->videoRect.height);
+#endif
+            param->result = dsERR_GENERAL;
         }
-    } else if (PROFILE_TV == profileType) {
-        INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
-        param->result = dsHdmiInScaleVideo(param->videoRect.x, param->videoRect.y, param->videoRect.width, param->videoRect.height);
     } else {
         INT_INFO("[%d][%s]: its Other Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsERR_GENERAL;
@@ -1384,24 +1739,29 @@ IARM_Result_t _dsHdmiInSelectZoomMode(void *arg)
     IARM_BUS_Lock(lock);
     dsHdmiInSelectZoomModeParam_t *param = (dsHdmiInSelectZoomModeParam_t *)arg;
 
-    if (!s_aidlPorts.empty()) {
-        sp<IPlaneControl> pc = getAidlPlaneCtrl();
-        if (!pc) {
-            param->result = dsERR_GENERAL;
+    if (PROFILE_TV == profileType) {
+        if (!s_aidlPorts.empty()) {
+            sp<IPlaneControl> pc = getAidlPlaneCtrl();
+            if (!pc) {
+                param->result = dsERR_GENERAL;
+            } else {
+                ::com::rdk::hal::PropertyValue aspectRatioVal;
+                aspectRatioVal.set<::com::rdk::hal::PropertyValue::Tag::intValue>(
+                    (int32_t)param->zoomMode);
+                bool result = false;
+                ::android::binder::Status st = pc->setProperty(
+                    HDMI_IN_PRIMARY_PLANE_INDEX,
+                    ::com::rdk::hal::planecontrol::Property::ASPECT_RATIO,
+                    aspectRatioVal, &result);
+                param->result = (st.isOk() && result) ? dsERR_NONE : dsERR_GENERAL;
+            }
         } else {
-            ::com::rdk::hal::PropertyValue aspectRatioVal;
-            aspectRatioVal.set<::com::rdk::hal::PropertyValue::Tag::intValue>(
-                (int32_t)param->zoomMode);
-            bool result = false;
-            ::android::binder::Status st = pc->setProperty(
-                HDMI_IN_PRIMARY_PLANE_INDEX,
-                ::com::rdk::hal::planecontrol::Property::ASPECT_RATIO,
-                aspectRatioVal, &result);
-            param->result = (st.isOk() && result) ? dsERR_NONE : dsERR_GENERAL;
+            INT_INFO("[%d][%s]: inline HAL fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
+#if 0
+            param->result = dsHdmiInSelectZoomMode(param->zoomMode);
+#endif
+            param->result = dsERR_GENERAL;
         }
-    } else if (PROFILE_TV == profileType) {
-        INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
-        param->result = dsHdmiInSelectZoomMode(param->zoomMode);
     } else {
         INT_INFO("[%d][%s]: its Other Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsERR_GENERAL;
@@ -1420,20 +1780,25 @@ IARM_Result_t _dsHdmiInGetCurrentVideoMode(void *arg)
 
     IARM_BUS_Lock(lock);
 
-    if (!s_aidlPorts.empty()) {
-        int vic = 0;
-        {
-            std::lock_guard<std::mutex> lk(s_aidlMutex);
-            if (s_aidlActivePort >= 0) {
-                auto it = s_aidlPorts.find(s_aidlActivePort);
-                if (it != s_aidlPorts.end()) vic = it->second.lastVIC;
+    if (PROFILE_TV == profileType) {
+        if (!s_aidlPorts.empty()) {
+            int vic = 0;
+            {
+                std::lock_guard<std::mutex> lk(s_aidlMutex);
+                if (s_aidlActivePort >= 0) {
+                    auto it = s_aidlPorts.find(s_aidlActivePort);
+                    if (it != s_aidlPorts.end()) vic = it->second.lastVIC;
+                }
             }
+            vicToResolutionObj_srv(vic, param->resolution);
+            param->result = dsERR_NONE;
+        } else {
+            INT_INFO("[%d][%s]: inline HAL fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
+#if 0
+            param->result = dsHdmiInGetCurrentVideoMode(&param->resolution);
+#endif
+            param->result = dsERR_GENERAL;
         }
-        vicToResolutionObj_srv(vic, param->resolution);
-        param->result = dsERR_NONE;
-    } else if (PROFILE_TV == profileType) {
-        INT_INFO("[%d][%s]: its TV Profile\r\n", __LINE__, __FUNCTION__);
-        param->result = dsHdmiInGetCurrentVideoMode(&param->resolution);
     } else {
         INT_INFO("[%d][%s]: its Other Profile\r\n", __LINE__, __FUNCTION__);
         param->result = dsERR_GENERAL;
@@ -1485,7 +1850,7 @@ void _dsHdmiInStatusChangeCB(dsHdmiInStatus_t inputStatus)
     IARM_Bus_BroadcastEvent(IARM_BUS_DSMGR_NAME,
                                 (IARM_EventId_t)IARM_BUS_DSMGR_EVENT_HDMI_IN_STATUS,
                                 (void *)&hdmi_in_status_eventData,
-[O                                sizeof(hdmi_in_status_eventData));
+                                sizeof(hdmi_in_status_eventData));
 
 }
 
@@ -1765,12 +2130,11 @@ IARM_Result_t _dsSetEdid2AllmSupport (void *arg)
 IARM_Result_t _dsGetEdid2AllmSupport (void *arg)
 {
     _DEBUG_ENTER();
-    bool allmSupport = false;
     dsEdidAllmSupportParam_t *param = (dsEdidAllmSupportParam_t *) arg;
     IARM_BUS_Lock(lock);
-    param->result =  dsERR_NONE;
-    // getEdid2AllmSupport will return the latest allm bit value of the specified port(which is written to persistence)
-    // irrespective of the edid version, the latest value is returned.
+    param->result = dsERR_NONE;
+    // This getter returns the persisted ALLM bit for the port.
+    // The value is implementation-agnostic, so there is no separate AIDL query here.
     param->allmSupport = m_edidallmsupport[param->iHdmiPort];
     INT_INFO("[srv] %s: dsGetEdid2AllmSupport : %d for port %d\r\n", __FUNCTION__, param->allmSupport,param->iHdmiPort);
     IARM_BUS_Unlock(lock);
@@ -1785,7 +2149,7 @@ void updateVRRBitValuesInPersistence(dsHdmiInPort_t iHdmiPort, bool vrrSupport)
 	  {	  
           std::string port_vrrSupport = "HDMI"+std::to_string(port_no)+".vrrEnable";
           device::HostPersistence::getInstance().persistHostProperty(port_vrrSupport, vrrSupport ? "TRUE" : "FALSE");
-[I          INT_INFO("Port HDMI%d: Persist EDID VRR Bit: %d\n", port_no, vrrSupport);
+          INT_INFO("Port HDMI%d: Persist EDID VRR Bit: %d\n", port_no, vrrSupport);
 	  }
 	  else
 	  {
@@ -1860,6 +2224,7 @@ static dsError_t getVRRSupport (dsHdmiInPort_t iHdmiPort, bool *vrrSupport) {
         }
         return dsERR_INVALID_PARAM;
     }
+#if 0
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsHdmiInGetVRRSupport_t)(dsHdmiInPort_t iHdmiPort, bool *vrrSupport);
     static dsHdmiInGetVRRSupport_t dsHdmiInGetVRRSupportFunc = 0;
@@ -1889,6 +2254,8 @@ static dsError_t getVRRSupport (dsHdmiInPort_t iHdmiPort, bool *vrrSupport) {
         INT_INFO("%s:  dsHdmiInGetVRRSupportFunc = %p\n", __FUNCTION__, dsHdmiInGetVRRSupportFunc);
     }
     return eRet;
+#endif
+    return dsERR_GENERAL;
 }
 
 IARM_Result_t _dsGetVRRSupport (void *arg)
@@ -1906,7 +2273,7 @@ IARM_Result_t _dsGetVRRSupport (void *arg)
     return IARM_RESULT_SUCCESS;
 }
 
-
+//TODO: Find a solution to implement this properly - WIP
 static dsError_t getVRRStatus (dsHdmiInPort_t iHdmiPort, dsHdmiInVrrStatus_t *vrrStatus) {
     if (!s_aidlPorts.empty()) {
         std::lock_guard<std::mutex> lk(s_aidlMutex);
@@ -1920,6 +2287,7 @@ static dsError_t getVRRStatus (dsHdmiInPort_t iHdmiPort, dsHdmiInVrrStatus_t *vr
         INT_INFO("[srv-aidl] getVRRStatus port %d type=%d\n", (int)iHdmiPort, vrrStatus->vrrType);
         return dsERR_NONE;
     }
+#if 0
     dsError_t eRet = dsERR_GENERAL;
     typedef dsError_t (*dsHdmiInGetVRRStatus_t)(dsHdmiInPort_t iHdmiPort, dsHdmiInVrrStatus_t *vrrStatus);
     static dsHdmiInGetVRRStatus_t dsHdmiInGetVRRStatusFunc = 0;
@@ -1948,6 +2316,8 @@ static dsError_t getVRRStatus (dsHdmiInPort_t iHdmiPort, dsHdmiInVrrStatus_t *vr
         INT_INFO("%s:  dsHdmiInGetVRRStatusFunc = %p\n", __FUNCTION__, dsHdmiInGetVRRStatusFunc);
     }
     return eRet;
+#endif
+    return dsERR_GENERAL;
 }
 
 IARM_Result_t _dsGetVRRStatus (void *arg)
@@ -1980,4 +2350,3 @@ IARM_Result_t _dsGetHdmiVersion (void *arg)
 }
 /** @} */
 /** @} */
-
