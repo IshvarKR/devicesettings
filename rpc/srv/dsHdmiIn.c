@@ -613,8 +613,7 @@ static dsError_t getHDMISPDInfo (dsHdmiInPort_t iHdmiPort, unsigned char *spd) {
             hi = it->second.hdmiInput;
         }
         std::vector<uint8_t> spdVec;
-        bool ok = false;
-        if (!hi->getSPDInfoFrame(&spdVec, &ok).isOk() || !ok || spdVec.empty()) {
+        if (!hi->getSPDInfoFrame(&spdVec).isOk() || spdVec.empty()) {
             INT_ERROR("[srv-aidl] getSPDInfoFrame failed for port %d\n", (int)iHdmiPort);
             return dsERR_GENERAL;
         }
