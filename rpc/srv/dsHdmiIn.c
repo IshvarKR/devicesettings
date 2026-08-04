@@ -157,13 +157,6 @@ static dsHdmiInCap_t hdmiInCap_gs;
 #include <com/rdk/hal/hdmiinput/HDCPStatus.h>
 #include <com/rdk/hal/hdmiinput/HDCPProtocolVersion.h>
 #include <com/rdk/hal/hdmiinput/HDMIVersion.h>
-#include <com/rdk/hal/planecontrol/IPlaneControl.h>
-#include <com/rdk/hal/planecontrol/PlaneCapabilities.h>
-#include <com/rdk/hal/planecontrol/Property.h>
-#include <com/rdk/hal/planecontrol/PropertyKVPair.h>
-#include <com/rdk/hal/planecontrol/SourcePlaneMapping.h>
-#include <com/rdk/hal/planecontrol/SourceType.h>
-#include <com/rdk/hal/PropertyValue.h>
 
 using android::sp;
 using android::defaultServiceManager;
@@ -171,9 +164,6 @@ using android::interface_cast;
 using android::String16;
 using android::ProcessState;
 using namespace com::rdk::hal::hdmiinput;
-using namespace com::rdk::hal::planecontrol;
-
-#define HDMI_IN_PRIMARY_PLANE_INDEX 0
 
 // Per-port AIDL runtime context
 struct AidlPortCtx {
@@ -191,7 +181,6 @@ struct AidlPortCtx {
 };
 
 static sp<IHDMIInputManager>       s_aidlHdmiMgr;
-static sp<IPlaneControl>           s_aidlPlaneCtrl;
 static std::mutex                  s_aidlMutex;
 static std::map<int, AidlPortCtx>  s_aidlPorts;
 static int                         s_aidlActivePort{-1};
@@ -210,19 +199,6 @@ static sp<IHDMIInputManager> getAidlHdmiMgr()
         }
     }
     return s_aidlHdmiMgr;
-}
-
-static sp<IPlaneControl> getAidlPlaneCtrl()
-{
-    std::lock_guard<std::mutex> lk(s_aidlMutex);
-    if (!s_aidlPlaneCtrl) {
-        sp<android::IServiceManager> sm = defaultServiceManager();
-        if (sm) {
-            s_aidlPlaneCtrl = interface_cast<IPlaneControl>(
-                sm->getService(String16(IPlaneControl::serviceName().c_str())));
-        }
-    }
-    return s_aidlPlaneCtrl;
 }
 
 static void vicToResolutionObj_srv(int vic, dsVideoPortResolution_t& res)
@@ -510,7 +486,6 @@ static void aidlHdmiInTerm()
     }
     s_aidlPorts.clear();
     s_aidlHdmiMgr   = nullptr;
-    s_aidlPlaneCtrl = nullptr;
     s_aidlPortCount = 0;
 }
 
@@ -1131,23 +1106,9 @@ static dsError_t getSupportedGameFeaturesList (dsSupportedGameFeatureList_t *fLi
 static dsError_t getAVLatency_hal (int *audio_latency, int *video_latency)
 {
     if (!s_aidlPorts.empty()) {
-        sp<IPlaneControl> pc = getAidlPlaneCtrl();
-        if (!pc) {
-            INT_ERROR("[srv-aidl] IPlaneControl unavailable\n");
-            *audio_latency = 0; *video_latency = 0;
-            return dsERR_NONE;
-        }
-        std::vector<::com::rdk::hal::planecontrol::PlaneCapabilities> planeCaps;
-        bool ok = false;
-        if (!pc->getCapabilities(&planeCaps, &ok).isOk() || !ok || planeCaps.empty()) {
-            INT_ERROR("[srv-aidl] PlaneControl getCapabilities failed\n");
-            *audio_latency = 0; *video_latency = 0;
-            return dsERR_NONE;
-        }
-        int latencyMs = planeCaps[0].vsyncDisplayLatency * 16;
-        *video_latency = latencyMs;
         *audio_latency = 0;
-        INT_INFO("[srv-aidl] getAVLatency audio=0 video=%d\n", *video_latency);
+        *video_latency = 0;
+        INT_INFO("[srv-aidl] getAVLatency unavailable without PlaneControl; returning 0/0\n");
         return dsERR_NONE;
     }
 #if 0
@@ -1693,29 +1654,8 @@ IARM_Result_t _dsHdmiInScaleVideo(void *arg)
 
     if (PROFILE_TV == profileType) {
         if (!s_aidlPorts.empty()) {
-            sp<IPlaneControl> pc = getAidlPlaneCtrl();
-            if (!pc) {
-                param->result = dsERR_GENERAL;
-            } else {
-                std::vector<::com::rdk::hal::planecontrol::PropertyKVPair> kvList;
-                ::com::rdk::hal::planecontrol::PropertyKVPair kv;
-                kv.property = ::com::rdk::hal::planecontrol::Property::X;
-                kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.x);
-                kvList.push_back(kv);
-                kv.property = ::com::rdk::hal::planecontrol::Property::Y;
-                kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.y);
-                kvList.push_back(kv);
-                kv.property = ::com::rdk::hal::planecontrol::Property::WIDTH;
-                kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.width);
-                kvList.push_back(kv);
-                kv.property = ::com::rdk::hal::planecontrol::Property::HEIGHT;
-                kv.propertyValue.set<::com::rdk::hal::PropertyValue::Tag::intValue>(param->videoRect.height);
-                kvList.push_back(kv);
-                bool result = false;
-                ::android::binder::Status st = pc->setPropertyMultiAtomic(
-                    HDMI_IN_PRIMARY_PLANE_INDEX, kvList, &result);
-                param->result = (st.isOk() && result) ? dsERR_NONE : dsERR_GENERAL;
-            }
+            INT_INFO("[%d][%s]: scaleVideo on hold pending PlaneControl availability\r\n", __LINE__, __FUNCTION__);
+            param->result = dsERR_OPERATION_NOT_SUPPORTED;
         } else {
             INT_INFO("[%d][%s]: inline HAL fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
 #if 0
@@ -1741,20 +1681,8 @@ IARM_Result_t _dsHdmiInSelectZoomMode(void *arg)
 
     if (PROFILE_TV == profileType) {
         if (!s_aidlPorts.empty()) {
-            sp<IPlaneControl> pc = getAidlPlaneCtrl();
-            if (!pc) {
-                param->result = dsERR_GENERAL;
-            } else {
-                ::com::rdk::hal::PropertyValue aspectRatioVal;
-                aspectRatioVal.set<::com::rdk::hal::PropertyValue::Tag::intValue>(
-                    (int32_t)param->zoomMode);
-                bool result = false;
-                ::android::binder::Status st = pc->setProperty(
-                    HDMI_IN_PRIMARY_PLANE_INDEX,
-                    ::com::rdk::hal::planecontrol::Property::ASPECT_RATIO,
-                    aspectRatioVal, &result);
-                param->result = (st.isOk() && result) ? dsERR_NONE : dsERR_GENERAL;
-            }
+            INT_INFO("[%d][%s]: selectZoomMode on hold pending PlaneControl availability\r\n", __LINE__, __FUNCTION__);
+            param->result = dsERR_OPERATION_NOT_SUPPORTED;
         } else {
             INT_INFO("[%d][%s]: inline HAL fallback disabled pending factory split\r\n", __LINE__, __FUNCTION__);
 #if 0
