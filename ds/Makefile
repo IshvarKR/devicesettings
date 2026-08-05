@@ -75,7 +75,6 @@ uninstall:
 
 clean:
 	@echo "Cleaning the directory..."
-[O	@$(RM) $(OBJS) $(LIBNAMEFULL)
-
+	@$(RM) $(OBJS) $(LIBNAMEFULL)
 
 
