@@ -376,10 +376,6 @@ public:
             ::com::rdk::hal::hdmiinput::HDCPStatus,
             ::com::rdk::hal::hdmiinput::HDCPProtocolVersion) override
         { return ::android::binder::Status::ok(); }
-    int32_t getInterfaceVersion() override
-        { return ::com::rdk::hal::hdmiinput::IHDMIInputControllerListener::VERSION; }
-    std::string getInterfaceHash() override
-        { return ::com::rdk::hal::hdmiinput::IHDMIInputControllerListener::HASHVALUE; }
 private:
     int m_portId;
 };
@@ -415,10 +411,6 @@ public:
     }
     ::android::binder::Status onEDIDChange(const std::vector<uint8_t>&) override
         { return ::android::binder::Status::ok(); }
-    int32_t getInterfaceVersion() override
-        { return ::com::rdk::hal::hdmiinput::IHDMIInputEventListener::VERSION; }
-    std::string getInterfaceHash() override
-        { return ::com::rdk::hal::hdmiinput::IHDMIInputEventListener::HASHVALUE; }
 private:
     int m_portId;
 };
